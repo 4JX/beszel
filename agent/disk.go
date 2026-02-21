@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -13,17 +14,41 @@ import (
 	"github.com/shirou/gopsutil/v4/disk"
 )
 
-// parseFilesystemEntry parses a filesystem entry in the format "device__customname"
-// Returns the device/filesystem part and the custom name part
-func parseFilesystemEntry(entry string) (device, customName string) {
-	entry = strings.TrimSpace(entry)
-	if parts := strings.SplitN(entry, "__", 2); len(parts) == 2 {
-		device = strings.TrimSpace(parts[0])
-		customName = strings.TrimSpace(parts[1])
-	} else {
-		device = entry
+type DiskEntry struct {
+	Identifier string
+	Alias      string
+	IoDevice   string
+}
+
+// parseDiskEntries parses a DISKS env var into a slice of DiskEntry
+// Format: <identifier>[:<alias>][:<io_device>],...
+func parseDiskEntries(disksEnv string) []DiskEntry {
+	var entries []DiskEntry
+	if disksEnv == "" {
+		return entries
 	}
-	return device, customName
+
+	for _, fsEntry := range strings.Split(disksEnv, ",") {
+		fsEntry = strings.TrimSpace(fsEntry)
+		if fsEntry == "" {
+			continue
+		}
+
+		parts := strings.Split(fsEntry, ":")
+		entry := DiskEntry{
+			Identifier: strings.TrimSpace(parts[0]),
+		}
+
+		if len(parts) > 1 {
+			entry.Alias = strings.TrimSpace(parts[1])
+		}
+		if len(parts) > 2 {
+			entry.IoDevice = strings.TrimSpace(parts[2])
+		}
+
+		entries = append(entries, entry)
+	}
+	return entries
 }
 
 func isDockerSpecialMountpoint(mountpoint string) bool {
@@ -37,9 +62,9 @@ func isDockerSpecialMountpoint(mountpoint string) bool {
 
 // Sets up the filesystems to monitor for disk usage and I/O.
 func (a *Agent) initializeDiskInfo() {
-	filesystem, _ := GetEnv("FILESYSTEM")
-	efPath := "/extra-filesystems"
-	hasRoot := false
+	disksEnv, _ := GetEnv("DISKS")
+	diskEntries := parseDiskEntries(disksEnv)
+
 	isWindows := runtime.GOOS == "windows"
 
 	partitions, err := disk.Partitions(false)
@@ -55,177 +80,243 @@ func (a *Agent) initializeDiskInfo() {
 		}
 	}
 
-	// ioContext := context.WithValue(a.sensorsContext,
-	// 	common.EnvKey, common.EnvMap{common.HostProcEnvKey: "/tmp/testproc"},
-	// )
-	// diskIoCounters, err := disk.IOCountersWithContext(ioContext)
-
 	diskIoCounters, err := disk.IOCounters()
 	if err != nil {
 		slog.Error("Error getting diskstats", "err", err)
 	}
 	slog.Debug("Disk I/O", "diskstats", diskIoCounters)
 
-	// Helper function to add a filesystem to fsStats if it doesn't exist
-	addFsStat := func(device, mountpoint string, root bool, customName ...string) {
-		var key string
-		if isWindows {
-			key = device
-		} else {
-			key = filepath.Base(device)
-		}
-		var ioMatch bool
-		if _, exists := a.fsStats[key]; !exists {
-			if root {
-				slog.Info("Detected root device", "name", key)
-				// Check if root device is in /proc/diskstats. Do not guess a
-				// fallback device for root: that can misattribute root I/O to a
-				// different disk while usage remains tied to root mountpoint.
-				if _, ioMatch = diskIoCounters[key]; !ioMatch {
-					if matchedKey, match := findIoDevice(filesystem, diskIoCounters); match {
-						key = matchedKey
-						ioMatch = true
-					} else {
-						slog.Warn("Root I/O unmapped; set FILESYSTEM", "device", device, "mountpoint", mountpoint)
-					}
-				}
-			} else {
-				// Check if non-root has diskstats and fall back to folder name if not
-				// Scenario: device is encrypted and named luks-2bcb02be-999d-4417-8d18-5c61e660fb6e - not in /proc/diskstats.
-				// However, the device can be specified by mounting folder from luks device at /extra-filesystems/sda1
-				if _, ioMatch = diskIoCounters[key]; !ioMatch {
-					efBase := filepath.Base(mountpoint)
-					if _, ioMatch = diskIoCounters[efBase]; ioMatch {
-						key = efBase
-					}
-				}
-			}
-			fsStats := &system.FsStats{Root: root, Mountpoint: mountpoint}
-			if len(customName) > 0 && customName[0] != "" {
-				fsStats.Name = customName[0]
-			}
-			a.fsStats[key] = fsStats
+	// 1. Auto-add root
+	rootMountPoint := a.getRootMountPoint()
+	var rootEntry DiskEntry
+	rootConfigured := false
+
+	// Check if user already configured root in DISKS
+	for _, entry := range diskEntries {
+		if entry.Identifier == rootMountPoint || entry.Identifier == "/" {
+			rootConfigured = true
+			break
 		}
 	}
 
-	// Get the appropriate root mount point for this system
-	rootMountPoint := a.getRootMountPoint()
-
-	// Use FILESYSTEM env var to find root filesystem
-	if filesystem != "" {
+	if !rootConfigured && !isWindows {
+		// Detect /etc/hosts for docker overlayfs fallback
+		dockerRootFound := false
 		for _, p := range partitions {
-			if strings.HasSuffix(p.Device, filesystem) || p.Mountpoint == filesystem {
-				addFsStat(p.Device, p.Mountpoint, true)
-				hasRoot = true
+			if isDockerSpecialMountpoint(p.Mountpoint) && strings.HasPrefix(p.Device, "/dev") {
+				rootEntry = DiskEntry{Identifier: p.Mountpoint, Alias: "root"}
+				dockerRootFound = true
 				break
 			}
 		}
-		if !hasRoot {
-			slog.Warn("Partition details not found", "filesystem", filesystem)
+		if !dockerRootFound {
+			rootEntry = DiskEntry{Identifier: rootMountPoint, Alias: "root"}
 		}
+		// Prepend auto-detected root
+		diskEntries = append([]DiskEntry{rootEntry}, diskEntries...)
+	} else if !rootConfigured && len(partitions) > 0 {
+		// Windows fallback (first partition)
+		rootEntry = DiskEntry{Identifier: partitions[0].Mountpoint, Alias: "root"}
+		diskEntries = append([]DiskEntry{rootEntry}, diskEntries...)
 	}
 
-	// Add EXTRA_FILESYSTEMS env var values to fsStats
-	if extraFilesystems, exists := GetEnv("EXTRA_FILESYSTEMS"); exists {
-		for fsEntry := range strings.SplitSeq(extraFilesystems, ",") {
-			// Parse custom name from format: device__customname
-			fs, customName := parseFilesystemEntry(fsEntry)
+	// 2. Process all disk entries
+	for i, entry := range diskEntries {
+		isRoot := (i == 0 && !rootConfigured) || (entry.Identifier == rootMountPoint || entry.Identifier == "/")
 
-			found := false
-			for _, p := range partitions {
-				if strings.HasSuffix(p.Device, fs) || p.Mountpoint == fs {
-					addFsStat(p.Device, p.Mountpoint, false, customName)
-					found = true
-					break
-				}
+		part, err := findPartition(entry.Identifier, partitions)
+		if err != nil {
+			if isRoot {
+				// Don't log a warning if it's the auto root and it just didn't exist
+				slog.Warn("Root device not detected; root I/O disabled", "mountpoint", entry.Identifier)
+				a.fsStats["root"] = &system.FsStats{Root: true, Mountpoint: entry.Identifier}
+			} else {
+				slog.Warn("Disk partition not found", "identifier", entry.Identifier)
 			}
-			// if not in partitions, test if we can get disk usage
-			if !found {
-				if _, err := disk.Usage(fs); err == nil {
-					addFsStat(filepath.Base(fs), fs, false, customName)
-				} else {
-					slog.Error("Invalid filesystem", "name", fs, "err", err)
-				}
-			}
-		}
-	}
-
-	// Process partitions for various mount points
-	for _, p := range partitions {
-		// fmt.Println(p.Device, p.Mountpoint)
-		// Binary root fallback or docker root fallback
-		if !hasRoot && (p.Mountpoint == rootMountPoint || (isDockerSpecialMountpoint(p.Mountpoint) && strings.HasPrefix(p.Device, "/dev"))) {
-			fs, match := findIoDevice(filepath.Base(p.Device), diskIoCounters)
-			if match {
-				addFsStat(fs, p.Mountpoint, true)
-				hasRoot = true
-			}
+			continue
 		}
 
-		// Check if device is in /extra-filesystems
-		if strings.HasPrefix(p.Mountpoint, efPath) {
-			device, customName := parseFilesystemEntry(p.Mountpoint)
-			addFsStat(device, p.Mountpoint, false, customName)
-		}
-	}
+		mountpoint := part.Mountpoint
 
-	// Check all folders in /extra-filesystems and add them if not already present
-	if folders, err := os.ReadDir(efPath); err == nil {
-		existingMountpoints := make(map[string]bool)
-		for _, stats := range a.fsStats {
-			existingMountpoints[stats.Mountpoint] = true
+		// Map key is mountpoint (except Windows, where we keep using device)
+		key := mountpoint
+		if isWindows {
+			key = part.Device
 		}
-		for _, folder := range folders {
-			if folder.IsDir() {
-				mountpoint := filepath.Join(efPath, folder.Name())
-				slog.Debug("/extra-filesystems", "mountpoint", mountpoint)
-				if !existingMountpoints[mountpoint] {
-					device, customName := parseFilesystemEntry(folder.Name())
-					addFsStat(device, mountpoint, false, customName)
-				}
+
+		if _, exists := a.fsStats[key]; exists {
+			continue // Already processed
+		}
+
+		// Resolve I/O device
+		var ioDevice string
+		var ioAvailable bool
+
+		if entry.IoDevice != "" {
+			ioDevice = entry.IoDevice
+			_, ioAvailable = diskIoCounters[ioDevice]
+		} else {
+			ioDevice, ioAvailable = resolveKernelDeviceName(part.Device, diskIoCounters)
+		}
+
+		if ioAvailable {
+			a.ioDeviceForMount[key] = ioDevice
+			slog.Info("Disk configured", "id", entry.Identifier, "alias", entry.Alias, "mountpoint", mountpoint, "device", part.Device, "ioDevice", ioDevice, "ioAvailable", ioAvailable)
+		} else {
+			slog.Warn("Disk configured", "id", entry.Identifier, "alias", entry.Alias, "mountpoint", mountpoint, "device", part.Device, "ioDevice", ioDevice, "ioAvailable", ioAvailable, "hint", "set io_device in DISKS entry")
+			// Log specific missing diskstats warning
+			if !isWindows && ioDevice == "" {
+				slog.Warn("No I/O stats for disk", "id", entry.Identifier, "resolvedDevice", part.Device, "hint", "The device is not in /proc/diskstats. Set the io_device field to the underlying physical device, e.g.: /mnt/backup:Backup:sda1")
 			}
 		}
-	}
 
-	// If no root filesystem set, use fallback
-	if !hasRoot {
-		rootKey := filepath.Base(rootMountPoint)
-		if _, exists := a.fsStats[rootKey]; exists {
-			rootKey = "root"
+		// Add to fsStats map
+		fsStats := &system.FsStats{
+			Root:       isRoot,
+			Mountpoint: mountpoint,
+			Name:       entry.Alias,
 		}
-		slog.Warn("Root device not detected; root I/O disabled", "mountpoint", rootMountPoint)
-		a.fsStats[rootKey] = &system.FsStats{Root: true, Mountpoint: rootMountPoint}
+		a.fsStats[key] = fsStats
 	}
 
 	a.initializeDiskIoStats(diskIoCounters)
 }
 
-// Returns matching device from /proc/diskstats.
-// bool is true if a match was found.
-func findIoDevice(filesystem string, diskIoCounters map[string]disk.IOCountersStat) (string, bool) {
+// findPartition resolves an identifier to a PartitionStat.
+// It handles symlinks (UUID, labels) and matching by mountpoint or device.
+func findPartition(identifier string, partitions []disk.PartitionStat) (*disk.PartitionStat, error) {
+	resolvedID := identifier
+	if symlinkTarget, err := filepath.EvalSymlinks(identifier); err == nil {
+		resolvedID = symlinkTarget
+	}
+
+	for _, p := range partitions {
+		if p.Mountpoint == identifier || p.Device == resolvedID {
+			return &p, nil
+		}
+	}
+
+	// Bind mount fallback (directories not in partitions but have usage)
+	if _, err := disk.Usage(identifier); err == nil {
+		return &disk.PartitionStat{
+			Mountpoint: identifier,
+			Device:     identifier,
+		}, nil
+	}
+
+	return nil, os.ErrNotExist
+}
+
+// parentDiskName strips trailing partition suffix: sda1→sda, nvme0n1p1→nvme0n1
+func parentDiskName(name string) string {
+	parent := strings.TrimRight(name, "0123456789")
+	if before, ok := strings.CutSuffix(parent, "p"); ok {
+		parent = before
+	}
+	if parent == name || parent == "" {
+		return ""
+	}
+	return parent
+}
+
+// walkBlockDeviceSlaves recursively checks if any slave device of kernelName
+// exists in diskIoCounters.
+func walkBlockDeviceSlaves(kernelName string, diskIoCounters map[string]disk.IOCountersStat) (string, bool) {
+	slavesDir := filepath.Join("/sys/block", kernelName, "slaves")
+	entries, err := os.ReadDir(slavesDir)
+	if err != nil {
+		return "", false
+	}
+
+	for _, entry := range entries {
+		slaveName := entry.Name()
+
+		// 1. Check if the slave itself is in diskstats
+		if _, exists := diskIoCounters[slaveName]; exists {
+			return slaveName, true
+		}
+
+		// 2. If the slave is a partition (e.g. sda1), try its parent disk (sda)
+		if parent := parentDiskName(slaveName); parent != "" {
+			if _, exists := diskIoCounters[parent]; exists {
+				return parent, true
+			}
+		}
+
+		// 3. Recurse down the tree
+		if match, found := walkBlockDeviceSlaves(slaveName, diskIoCounters); found {
+			return match, true
+		}
+	}
+
+	return "", false
+}
+
+// resolveKernelDeviceName determines the best diskstats key for a given device path.
+func resolveKernelDeviceName(devicePath string, diskIoCounters map[string]disk.IOCountersStat) (string, bool) {
+	if runtime.GOOS != "linux" {
+		base := filepath.Base(devicePath)
+		_, exists := diskIoCounters[base]
+		return base, exists
+	}
+
+	resolvedPath := devicePath
+	if symlinkTarget, err := filepath.EvalSymlinks(devicePath); err == nil {
+		resolvedPath = symlinkTarget
+	}
+	kernelName := filepath.Base(resolvedPath)
+
+	// 1. Try exact match
+	if _, exists := diskIoCounters[kernelName]; exists {
+		return kernelName, true
+	}
+
+	// 2. If device is a partition, try parent disk
+	if parent := parentDiskName(kernelName); parent != "" {
+		if _, exists := diskIoCounters[parent]; exists {
+			return parent, true
+		}
+	}
+
+	// 3. Walk /sys/block/*/slaves
+	if match, found := walkBlockDeviceSlaves(kernelName, diskIoCounters); found {
+		return match, true
+	}
+
+	// 4. Fallback checking label/name
 	for _, d := range diskIoCounters {
-		if d.Name == filesystem || (d.Label != "" && d.Label == filesystem) {
+		if d.Name == kernelName || (d.Label != "" && d.Label == kernelName) {
 			return d.Name, true
 		}
 	}
+
 	return "", false
 }
 
 // Sets start values for disk I/O stats.
 func (a *Agent) initializeDiskIoStats(diskIoCounters map[string]disk.IOCountersStat) {
-	for device, stats := range a.fsStats {
-		// skip if not in diskIoCounters
-		d, exists := diskIoCounters[device]
-		if !exists {
-			slog.Warn("Device not found in diskstats", "name", device)
+	for key, stats := range a.fsStats {
+		ioDevice, mapped := a.ioDeviceForMount[key]
+		if !mapped {
+			// No I/O device resolved for this disk
 			continue
 		}
+
+		d, exists := diskIoCounters[ioDevice]
+		if !exists {
+			slog.Warn("Device not found in diskstats", "name", ioDevice, "key", key)
+			continue
+		}
+
 		// populate initial values
 		stats.Time = time.Now()
 		stats.TotalRead = d.ReadBytes
 		stats.TotalWrite = d.WriteBytes
-		// add to list of valid io device names
-		a.fsNames = append(a.fsNames, device)
+
+		// add to list of valid io device names (avoid exact duplicates)
+		if !slices.Contains(a.fsNames, ioDevice) {
+			a.fsNames = append(a.fsNames, ioDevice)
+		}
 	}
 }
 
@@ -277,27 +368,41 @@ func (a *Agent) updateDiskIo(cacheTimeMs uint16, systemStats *system.Stats) {
 			a.diskPrev[cacheTimeMs] = make(map[string]prevDisk)
 		}
 		now := time.Now()
+
+		// Create a reverse map for the current names in diskstats to our internal fsStats keys (mountpoints)
+		ioDeviceToKey := make(map[string]string)
+		for key, ioDevice := range a.ioDeviceForMount {
+			ioDeviceToKey[ioDevice] = key
+		}
+
 		for name, d := range ioCounters {
-			stats := a.fsStats[d.Name]
+			// Find the internal key (mountpoint) for this io device
+			key, ok := ioDeviceToKey[name]
+			if !ok {
+				continue
+			}
+
+			stats := a.fsStats[key]
 			if stats == nil {
 				// skip devices not tracked
 				continue
 			}
 
-			// Previous snapshot for this interval and device
-			prev, hasPrev := a.diskPrev[cacheTimeMs][name]
+			// Previous snapshot for this interval and device (keyed by mountpoint)
+			prev, hasPrev := a.diskPrev[cacheTimeMs][key]
+			snap := prevDisk{readBytes: d.ReadBytes, writeBytes: d.WriteBytes, at: now}
 			if !hasPrev {
 				// Seed from agent-level fsStats if present, else seed from current
 				prev = prevDisk{readBytes: stats.TotalRead, writeBytes: stats.TotalWrite, at: stats.Time}
 				if prev.at.IsZero() {
-					prev = prevDisk{readBytes: d.ReadBytes, writeBytes: d.WriteBytes, at: now}
+					prev = snap
 				}
 			}
 
 			msElapsed := uint64(now.Sub(prev.at).Milliseconds())
 			if msElapsed < 100 {
 				// Avoid division by zero or clock issues; update snapshot and continue
-				a.diskPrev[cacheTimeMs][name] = prevDisk{readBytes: d.ReadBytes, writeBytes: d.WriteBytes, at: now}
+				a.diskPrev[cacheTimeMs][key] = snap
 				continue
 			}
 
@@ -310,14 +415,14 @@ func (a *Agent) updateDiskIo(cacheTimeMs uint16, systemStats *system.Stats) {
 			if readMbPerSecond > 50_000 || writeMbPerSecond > 50_000 {
 				slog.Warn("Invalid disk I/O. Resetting.", "name", d.Name, "read", readMbPerSecond, "write", writeMbPerSecond)
 				// Reset interval snapshot and seed from current
-				a.diskPrev[cacheTimeMs][name] = prevDisk{readBytes: d.ReadBytes, writeBytes: d.WriteBytes, at: now}
+				a.diskPrev[cacheTimeMs][key] = snap
 				// also refresh agent baseline to avoid future negatives
 				a.initializeDiskIoStats(ioCounters)
 				continue
 			}
 
 			// Update per-interval snapshot
-			a.diskPrev[cacheTimeMs][name] = prevDisk{readBytes: d.ReadBytes, writeBytes: d.WriteBytes, at: now}
+			a.diskPrev[cacheTimeMs][key] = snap
 
 			// Update global fsStats baseline for cross-interval correctness
 			stats.Time = now
