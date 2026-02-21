@@ -4,7 +4,8 @@ package agent
 
 import (
 	"os"
-	"strings"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -13,119 +14,88 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestParseFilesystemEntry(t *testing.T) {
+func TestParseDiskEntries(t *testing.T) {
 	tests := []struct {
-		name         string
-		input        string
-		expectedFs   string
-		expectedName string
+		name     string
+		input    string
+		expected []DiskEntry
 	}{
 		{
-			name:         "simple device name",
-			input:        "sda1",
-			expectedFs:   "sda1",
-			expectedName: "",
+			name:     "empty",
+			input:    "",
+			expected: nil,
 		},
 		{
-			name:         "device with custom name",
-			input:        "sda1__my-storage",
-			expectedFs:   "sda1",
-			expectedName: "my-storage",
+			name:  "single identifier",
+			input: "/mnt/data",
+			expected: []DiskEntry{
+				{Identifier: "/mnt/data"},
+			},
 		},
 		{
-			name:         "full device path with custom name",
-			input:        "/dev/sdb1__backup-drive",
-			expectedFs:   "/dev/sdb1",
-			expectedName: "backup-drive",
+			name:  "identifier and alias",
+			input: "/mnt/data:Data",
+			expected: []DiskEntry{
+				{Identifier: "/mnt/data", Alias: "Data"},
+			},
 		},
 		{
-			name:         "NVMe device with custom name",
-			input:        "nvme0n1p2__fast-ssd",
-			expectedFs:   "nvme0n1p2",
-			expectedName: "fast-ssd",
+			name:  "identifier, alias and iodevice",
+			input: "/mnt/data:Data:sda1",
+			expected: []DiskEntry{
+				{Identifier: "/mnt/data", Alias: "Data", IoDevice: "sda1"},
+			},
 		},
 		{
-			name:         "whitespace trimmed",
-			input:        "  sda2__trimmed-name  ",
-			expectedFs:   "sda2",
-			expectedName: "trimmed-name",
+			name:  "missing alias with iodevice",
+			input: "/mnt/data::sda1",
+			expected: []DiskEntry{
+				{Identifier: "/mnt/data", Alias: "", IoDevice: "sda1"},
+			},
 		},
 		{
-			name:         "empty custom name",
-			input:        "sda3__",
-			expectedFs:   "sda3",
-			expectedName: "",
+			name:  "multiple entries",
+			input: "/mnt/data:Data, /dev/sdb1, /mnt/tank:Tank:nvme0n1",
+			expected: []DiskEntry{
+				{Identifier: "/mnt/data", Alias: "Data"},
+				{Identifier: "/dev/sdb1"},
+				{Identifier: "/mnt/tank", Alias: "Tank", IoDevice: "nvme0n1"},
+			},
 		},
 		{
-			name:         "empty device name",
-			input:        "__just-custom",
-			expectedFs:   "",
-			expectedName: "just-custom",
+			name:  "whitespace trimmed",
+			input: "  /mnt/data : Data : sda1  ,  /dev/sdb1  ",
+			expected: []DiskEntry{
+				{Identifier: "/mnt/data", Alias: "Data", IoDevice: "sda1"},
+				{Identifier: "/dev/sdb1"},
+			},
 		},
 		{
-			name:         "multiple underscores in custom name",
-			input:        "sda1__my_custom_drive",
-			expectedFs:   "sda1",
-			expectedName: "my_custom_drive",
+			name:  "root override",
+			input: "/:ServerRoot",
+			expected: []DiskEntry{
+				{Identifier: "/", Alias: "ServerRoot"},
+			},
 		},
 		{
-			name:         "custom name with spaces",
-			input:        "sda1__My Storage Drive",
-			expectedFs:   "sda1",
-			expectedName: "My Storage Drive",
+			name:  "UUID",
+			input: "/dev/disk/by-uuid/1234-5678:FlashDrive",
+			expected: []DiskEntry{
+				{Identifier: "/dev/disk/by-uuid/1234-5678", Alias: "FlashDrive"},
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fsEntry := strings.TrimSpace(tt.input)
-			var fs, customName string
-			if parts := strings.SplitN(fsEntry, "__", 2); len(parts) == 2 {
-				fs = strings.TrimSpace(parts[0])
-				customName = strings.TrimSpace(parts[1])
+			entries := parseDiskEntries(tt.input)
+			if tt.expected == nil {
+				assert.Empty(t, entries)
 			} else {
-				fs = fsEntry
+				assert.Equal(t, tt.expected, entries)
 			}
-
-			assert.Equal(t, tt.expectedFs, fs)
-			assert.Equal(t, tt.expectedName, customName)
 		})
 	}
-}
-
-func TestFindIoDevice(t *testing.T) {
-	t.Run("matches by device name", func(t *testing.T) {
-		ioCounters := map[string]disk.IOCountersStat{
-			"sda": {Name: "sda"},
-			"sdb": {Name: "sdb"},
-		}
-
-		device, ok := findIoDevice("sdb", ioCounters)
-		assert.True(t, ok)
-		assert.Equal(t, "sdb", device)
-	})
-
-	t.Run("matches by device label", func(t *testing.T) {
-		ioCounters := map[string]disk.IOCountersStat{
-			"sda": {Name: "sda", Label: "rootfs"},
-			"sdb": {Name: "sdb"},
-		}
-
-		device, ok := findIoDevice("rootfs", ioCounters)
-		assert.True(t, ok)
-		assert.Equal(t, "sda", device)
-	})
-
-	t.Run("returns no fallback when not found", func(t *testing.T) {
-		ioCounters := map[string]disk.IOCountersStat{
-			"sda": {Name: "sda"},
-			"sdb": {Name: "sdb"},
-		}
-
-		device, ok := findIoDevice("nvme0n1p1", ioCounters)
-		assert.False(t, ok)
-		assert.Equal(t, "", device)
-	})
 }
 
 func TestIsDockerSpecialMountpoint(t *testing.T) {
@@ -149,143 +119,145 @@ func TestIsDockerSpecialMountpoint(t *testing.T) {
 	}
 }
 
-func TestInitializeDiskInfoWithCustomNames(t *testing.T) {
-	// Set up environment variables
-	oldEnv := os.Getenv("EXTRA_FILESYSTEMS")
-	defer func() {
-		if oldEnv != "" {
-			os.Setenv("EXTRA_FILESYSTEMS", oldEnv)
-		} else {
-			os.Unsetenv("EXTRA_FILESYSTEMS")
-		}
-	}()
+func TestFindPartition(t *testing.T) {
+	// Create a temporary file to act as our "bind mount pointer" or fake usage test
+	tmpDir := t.TempDir()
 
-	// Test with custom names
-	os.Setenv("EXTRA_FILESYSTEMS", "sda1__my-storage,/dev/sdb1__backup-drive,nvme0n1p2")
+	// Create a dummy file to act as our fake device so EvalSymlinks doesn't fail
+	fakeDevicePath := filepath.Join(tmpDir, "fake-sda1")
+	err := os.WriteFile(fakeDevicePath, []byte(""), 0644)
+	if err != nil {
+		t.Fatalf("Failed to create fake device: %v", err)
+	}
 
-	// Mock disk partitions (we'll just test the parsing logic)
-	// Since the actual disk operations are system-dependent, we'll focus on the parsing
-	testCases := []struct {
-		envValue      string
-		expectedFs    []string
-		expectedNames map[string]string
+	// Create a symlink to test path resolution
+	symlinkPath := filepath.Join(tmpDir, "symlink-to-sda1")
+	err = os.Symlink(fakeDevicePath, symlinkPath)
+	if err != nil {
+		t.Fatalf("Failed to create symlink: %v", err)
+	}
+
+	// Setup test partitions using our fake paths where necessary
+	partitions := []disk.PartitionStat{
+		{Device: fakeDevicePath, Mountpoint: "/mnt/data"},
+		{Device: "/dev/sdb1", Mountpoint: "/mnt/backup"},
+		{Device: "/dev/nvme0n1p1", Mountpoint: "/"},
+	}
+
+	tests := []struct {
+		name       string
+		identifier string
+		expected   string // device path expected
+		expectErr  bool
 	}{
 		{
-			envValue:   "sda1__my-storage,sdb1__backup-drive",
-			expectedFs: []string{"sda1", "sdb1"},
-			expectedNames: map[string]string{
-				"sda1": "my-storage",
-				"sdb1": "backup-drive",
-			},
+			name:       "match by mountpoint",
+			identifier: "/mnt/data",
+			expected:   fakeDevicePath,
+			expectErr:  false,
 		},
 		{
-			envValue:   "sda1,nvme0n1p2__fast-ssd",
-			expectedFs: []string{"sda1", "nvme0n1p2"},
-			expectedNames: map[string]string{
-				"nvme0n1p2": "fast-ssd",
-			},
+			name:       "match by device path",
+			identifier: "/dev/sdb1",
+			expected:   "/dev/sdb1",
+			expectErr:  false,
+		},
+		{
+			name:       "match by symlink",
+			identifier: symlinkPath,
+			expected:   fakeDevicePath,
+			expectErr:  false,
+		},
+		{
+			name:       "bind mount fallback (existing dir)",
+			identifier: tmpDir,
+			expected:   tmpDir, // Bind mount returns identifier as both device and mountpoint
+			expectErr:  false,
+		},
+		{
+			name:       "not found",
+			identifier: "/does/not/exist",
+			expected:   "",
+			expectErr:  true,
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run("env_"+tc.envValue, func(t *testing.T) {
-			os.Setenv("EXTRA_FILESYSTEMS", tc.envValue)
-
-			// Create mock partitions that would match our test cases
-			partitions := []disk.PartitionStat{}
-			for _, fs := range tc.expectedFs {
-				if strings.HasPrefix(fs, "/dev/") {
-					partitions = append(partitions, disk.PartitionStat{
-						Device:     fs,
-						Mountpoint: fs,
-					})
-				} else {
-					partitions = append(partitions, disk.PartitionStat{
-						Device:     "/dev/" + fs,
-						Mountpoint: "/" + fs,
-					})
-				}
-			}
-
-			// Test the parsing logic by calling the relevant part
-			// We'll create a simplified version to test just the parsing
-			extraFilesystems := tc.envValue
-			for _, fsEntry := range strings.Split(extraFilesystems, ",") {
-				// Parse the entry
-				fsEntry = strings.TrimSpace(fsEntry)
-				var fs, customName string
-				if parts := strings.SplitN(fsEntry, "__", 2); len(parts) == 2 {
-					fs = strings.TrimSpace(parts[0])
-					customName = strings.TrimSpace(parts[1])
-				} else {
-					fs = fsEntry
-				}
-
-				// Verify the device is in our expected list
-				assert.Contains(t, tc.expectedFs, fs, "parsed device should be in expected list")
-
-				// Check if custom name should exist
-				if expectedName, exists := tc.expectedNames[fs]; exists {
-					assert.Equal(t, expectedName, customName, "custom name should match expected")
-				} else {
-					assert.Empty(t, customName, "custom name should be empty when not expected")
-				}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			part, err := findPartition(tt.identifier, partitions)
+			if tt.expectErr {
+				assert.Error(t, err)
+				assert.Nil(t, part)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, part)
+				assert.Equal(t, tt.expected, part.Device)
 			}
 		})
 	}
 }
 
-func TestFsStatsWithCustomNames(t *testing.T) {
-	// Test that FsStats properly stores custom names
-	fsStats := &system.FsStats{
-		Mountpoint: "/mnt/storage",
-		Name:       "my-custom-storage",
-		DiskTotal:  100.0,
-		DiskUsed:   50.0,
+func TestResolveKernelDeviceName(t *testing.T) {
+	ioCounters := map[string]disk.IOCountersStat{
+		"sda":      {Name: "sda"},
+		"sda1":     {Name: "sda1"},
+		"nvme0n1":  {Name: "nvme0n1"},
+		"dm-0":     {Name: "dm-0"},
+		"oldlabel": {Name: "old_device", Label: "oldlabel"},
 	}
 
-	assert.Equal(t, "my-custom-storage", fsStats.Name)
-	assert.Equal(t, "/mnt/storage", fsStats.Mountpoint)
-	assert.Equal(t, 100.0, fsStats.DiskTotal)
-	assert.Equal(t, 50.0, fsStats.DiskUsed)
-}
-
-func TestExtraFsKeyGeneration(t *testing.T) {
-	// Test the logic for generating ExtraFs keys with custom names
-	testCases := []struct {
-		name        string
-		deviceName  string
-		customName  string
-		expectedKey string
+	tests := []struct {
+		name       string
+		devicePath string
+		expected   string
+		found      bool
 	}{
 		{
-			name:        "with custom name",
-			deviceName:  "sda1",
-			customName:  "my-storage",
-			expectedKey: "my-storage",
+			name:       "exact match",
+			devicePath: "/dev/sda1",
+			expected:   "sda1",
+			found:      true,
 		},
 		{
-			name:        "without custom name",
-			deviceName:  "sda1",
-			customName:  "",
-			expectedKey: "sda1",
+			name:       "partition strips to parent",
+			devicePath: "/dev/sda2",
+			expected:   "sda",
+			found:      true,
 		},
 		{
-			name:        "empty custom name falls back to device",
-			deviceName:  "nvme0n1p2",
-			customName:  "",
-			expectedKey: "nvme0n1p2",
+			name:       "nvme partition strips to parent",
+			devicePath: "/dev/nvme0n1p2",
+			expected:   "nvme0n1",
+			found:      true,
+		},
+		{
+			name:       "label fallback",
+			devicePath: "/dev/mapper/oldlabel",
+			expected:   "old_device",
+			found:      true,
+		},
+		{
+			name:       "not found",
+			devicePath: "/dev/does_not_exist",
+			expected:   "",
+			found:      false,
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			// Simulate the key generation logic from agent.go
-			key := tc.deviceName
-			if tc.customName != "" {
-				key = tc.customName
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			match, found := resolveKernelDeviceName(tt.devicePath, ioCounters)
+
+			// If we are not on linux, the function just checks filepath.Base
+			// so skip exact matching behavior tests if non-linux and it wouldn't match.
+			if runtime.GOOS != "linux" && tt.name != "exact match" {
+				t.Skip("skipping linux-specific resolution tests on non-linux")
 			}
-			assert.Equal(t, tc.expectedKey, key)
+
+			assert.Equal(t, tt.found, found)
+			if found {
+				assert.Equal(t, tt.expected, match)
+			}
 		})
 	}
 }

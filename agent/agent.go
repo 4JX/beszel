@@ -7,6 +7,7 @@ package agent
 import (
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +26,8 @@ type Agent struct {
 	zfs                       bool                                                  // true if system has arcstats
 	memCalc                   string                                                // Memory calculation formula
 	fsNames                   []string                                              // List of filesystem device names being monitored
-	fsStats                   map[string]*system.FsStats                            // Keeps track of disk stats for each filesystem
+	fsStats                   map[string]*system.FsStats                            // Keeps track of disk stats for each filesystem (keyed by mountpoint)
+	ioDeviceForMount          map[string]string                                     // Maps mountpoint to kernel device name for I/O lookups
 	diskPrev                  map[uint16]map[string]prevDisk                        // Previous disk I/O counters per cache interval
 	diskUsageCacheDuration    time.Duration                                         // How long to cache disk usage (to avoid waking sleeping disks)
 	lastDiskUsageUpdate       time.Time                                             // Last time disk usage was collected
@@ -51,8 +53,9 @@ type Agent struct {
 // If the data directory is not set, it will attempt to find the optimal directory.
 func NewAgent(dataDir ...string) (agent *Agent, err error) {
 	agent = &Agent{
-		fsStats: make(map[string]*system.FsStats),
-		cache:   NewSystemDataCache(),
+		fsStats:          make(map[string]*system.FsStats),
+		ioDeviceForMount: make(map[string]string),
+		cache:            NewSystemDataCache(),
 	}
 
 	// Initialize disk I/O previous counters storage
@@ -205,10 +208,10 @@ func (a *Agent) gatherStats(options common.DataRequestOptions) *system.CombinedD
 	data.Info.ExtraFsPct = make(map[string]float64)
 	for name, stats := range a.fsStats {
 		if !stats.Root && stats.DiskTotal > 0 {
-			// Use custom name if available, otherwise use device name
-			key := name
-			if stats.Name != "" {
-				key = stats.Name
+			// Use custom name (alias) if available, otherwise use mountpoint basename
+			key := stats.Name
+			if key == "" {
+				key = filepath.Base(name) // name is mountpoint
 			}
 			data.Stats.ExtraFs[key] = stats
 			// Add percentages to Info struct for dashboard
