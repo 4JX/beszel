@@ -93,7 +93,7 @@ func (a *Agent) initializeDiskInfo() {
 
 	// Check if user already configured root in DISKS
 	for _, entry := range diskEntries {
-		if entry.Identifier == rootMountPoint || entry.Identifier == "/" {
+		if entry.Identifier == rootMountPoint || entry.Identifier == "/" || entry.Alias == "root" {
 			rootConfigured = true
 			break
 		}
@@ -122,7 +122,7 @@ func (a *Agent) initializeDiskInfo() {
 
 	// 2. Process all disk entries
 	for i, entry := range diskEntries {
-		isRoot := (i == 0 && !rootConfigured) || (entry.Identifier == rootMountPoint || entry.Identifier == "/")
+		isRoot := (i == 0 && !rootConfigured) || (entry.Identifier == rootMountPoint || entry.Identifier == "/" || entry.Alias == "root")
 
 		part, err := findPartition(entry.Identifier, partitions)
 		if err != nil {
