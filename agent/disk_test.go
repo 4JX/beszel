@@ -197,13 +197,67 @@ func TestFindPartition(t *testing.T) {
 	}
 }
 
+func TestGetBlockDeviceForMount(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping linux-specific mountinfo tests on non-linux")
+	}
+
+	// Create a mock mountinfo file
+	tmpDir := t.TempDir()
+	mockProcFile := filepath.Join(tmpDir, "mountinfo")
+
+	// Mock /proc/self/mountinfo content
+	// Fields:
+	// 1: mount ID
+	// 2: parent ID
+	// 3: major:minor
+	// 4: root
+	// 5: mount point
+	// 6: mount options
+	// 7: optional fields
+	// 8: separator (-)
+	// 9: filesystem type
+	// 10: mount source
+	// 11: super options
+	mockData := `25 30 8:2 / / rw,relatime - ext4 /dev/sda2 rw
+26 25 0:21 / /dev rw,nosuid,relatime - devtmpfs devtmpfs rw,size=16301136k,nr_inodes=4075284,mode=755
+27 25 8:2 /var/lib/docker/containers /mnt/root rw,relatime - ext4 /dev/sda2 rw
+36 35 0:20 / /sys rw,nosuid,nodev,noexec,relatime - sysfs sysfs rw
+37 35 8:3 / /mnt/backup rw,relatime - ext4 /dev/sda3 rw
+`
+	err := os.WriteFile(mockProcFile, []byte(mockData), 0644)
+	if err != nil {
+		t.Fatalf("Failed to create mock mountinfo: %v", err)
+	}
+
+	t.Run("resolve root", func(t *testing.T) {
+		dev := getBlockDeviceForMount("/", mockProcFile)
+		assert.Equal(t, "/dev/sda2", dev)
+	})
+
+	t.Run("resolve bind mount", func(t *testing.T) {
+		dev := getBlockDeviceForMount("/mnt/root", mockProcFile)
+		assert.Equal(t, "/dev/sda2", dev)
+	})
+
+	t.Run("resolve specific mount", func(t *testing.T) {
+		dev := getBlockDeviceForMount("/mnt/backup", mockProcFile)
+		assert.Equal(t, "/dev/sda3", dev)
+	})
+
+	t.Run("pseudo fs is ignored", func(t *testing.T) {
+		dev := getBlockDeviceForMount("/sys", mockProcFile)
+		assert.Equal(t, "", dev, "sysfs should return empty as it does not start with /")
+	})
+}
+
 func TestResolveKernelDeviceName(t *testing.T) {
 	ioCounters := map[string]disk.IOCountersStat{
-		"sda":      {Name: "sda"},
-		"sda1":     {Name: "sda1"},
-		"nvme0n1":  {Name: "nvme0n1"},
-		"dm-0":     {Name: "dm-0"},
-		"oldlabel": {Name: "old_device", Label: "oldlabel"},
+		"sda":        {Name: "sda"},
+		"sda1":       {Name: "sda1"},
+		"nvme0n1":    {Name: "nvme0n1"},
+		"dm-0":       {Name: "dm-0"},
+		"old_device": {Name: "old_device", Label: "oldlabel"},
 	}
 
 	tests := []struct {
