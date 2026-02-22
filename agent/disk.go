@@ -182,12 +182,68 @@ func (a *Agent) initializeDiskInfo() {
 	a.initializeDiskIoStats(diskIoCounters)
 }
 
+// getBlockDeviceForMount reads /proc/self/mountinfo on Linux to find the underlying
+// block device for a given mountpoint
+func getBlockDeviceForMount(mountpoint string, mountinfoPath string) string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+
+	data, err := os.ReadFile(mountinfoPath)
+	if err != nil {
+		return ""
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.SplitN(line, " - ", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		fields := strings.Fields(parts[0])
+		if len(fields) < 5 {
+			continue
+		}
+
+		// Field 5 is the mount point
+		if fields[4] != mountpoint {
+			continue
+		}
+
+		afterSep := strings.Fields(parts[1])
+		if len(afterSep) < 2 {
+			continue
+		}
+
+		// Field 10 (afterSep index 1) is the mount source
+		source := afterSep[1]
+		if strings.HasPrefix(source, "/") {
+			return source
+		}
+	}
+
+	return ""
+}
+
 // findPartition resolves an identifier to a PartitionStat.
 // It handles symlinks (UUID, labels) and matching by mountpoint or device.
 func findPartition(identifier string, partitions []disk.PartitionStat) (*disk.PartitionStat, error) {
 	resolvedID := identifier
 	if symlinkTarget, err := filepath.EvalSymlinks(identifier); err == nil {
 		resolvedID = symlinkTarget
+	}
+
+	// Linux: Always try to get the raw block device first.
+	// This bypasses gopsutil's bind mount handling.
+	// See https://github.com/shirou/gopsutil/pull/1931/changes/e370cf64ade6646d44f98afa266b0ff19819f44d
+	if runtime.GOOS == "linux" {
+		realDev := getBlockDeviceForMount(identifier, "/proc/self/mountinfo")
+		if realDev != "" {
+			return &disk.PartitionStat{
+				Mountpoint: identifier,
+				Device:     realDev,
+			}, nil
+		}
 	}
 
 	for _, p := range partitions {
