@@ -5,7 +5,6 @@ package agent
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
@@ -34,28 +33,28 @@ func TestParseDiskEntries(t *testing.T) {
 		},
 		{
 			name:  "identifier and alias",
-			input: "/mnt/data:Data",
+			input: "/mnt/data|Data",
 			expected: []DiskEntry{
 				{Identifier: "/mnt/data", Alias: "Data"},
 			},
 		},
 		{
 			name:  "identifier, alias and iodevice",
-			input: "/mnt/data:Data:sda1",
+			input: "/mnt/data|Data|sda1",
 			expected: []DiskEntry{
 				{Identifier: "/mnt/data", Alias: "Data", IoDevice: "sda1"},
 			},
 		},
 		{
 			name:  "missing alias with iodevice",
-			input: "/mnt/data::sda1",
+			input: "/mnt/data||sda1",
 			expected: []DiskEntry{
 				{Identifier: "/mnt/data", Alias: "", IoDevice: "sda1"},
 			},
 		},
 		{
 			name:  "multiple entries",
-			input: "/mnt/data:Data, /dev/sdb1, /mnt/tank:Tank:nvme0n1",
+			input: "/mnt/data|Data, /dev/sdb1, /mnt/tank|Tank|nvme0n1",
 			expected: []DiskEntry{
 				{Identifier: "/mnt/data", Alias: "Data"},
 				{Identifier: "/dev/sdb1"},
@@ -64,7 +63,7 @@ func TestParseDiskEntries(t *testing.T) {
 		},
 		{
 			name:  "whitespace trimmed",
-			input: "  /mnt/data : Data : sda1  ,  /dev/sdb1  ",
+			input: "  /mnt/data | Data | sda1  ,  /dev/sdb1  ",
 			expected: []DiskEntry{
 				{Identifier: "/mnt/data", Alias: "Data", IoDevice: "sda1"},
 				{Identifier: "/dev/sdb1"},
@@ -72,14 +71,14 @@ func TestParseDiskEntries(t *testing.T) {
 		},
 		{
 			name:  "root override",
-			input: "/:ServerRoot",
+			input: "/|ServerRoot",
 			expected: []DiskEntry{
 				{Identifier: "/", Alias: "ServerRoot"},
 			},
 		},
 		{
 			name:  "UUID",
-			input: "/dev/disk/by-uuid/1234-5678:FlashDrive",
+			input: "/dev/disk/by-uuid/1234-5678|FlashDrive",
 			expected: []DiskEntry{
 				{Identifier: "/dev/disk/by-uuid/1234-5678", Alias: "FlashDrive"},
 			},
@@ -196,61 +195,6 @@ func TestFindPartition(t *testing.T) {
 		})
 	}
 }
-
-func TestGetBlockDeviceForMount(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("skipping linux-specific mountinfo tests on non-linux")
-	}
-
-	// Create a mock mountinfo file
-	tmpDir := t.TempDir()
-	mockProcFile := filepath.Join(tmpDir, "mountinfo")
-
-	// Mock /proc/self/mountinfo content
-	// Fields:
-	// 1: mount ID
-	// 2: parent ID
-	// 3: major:minor
-	// 4: root
-	// 5: mount point
-	// 6: mount options
-	// 7: optional fields
-	// 8: separator (-)
-	// 9: filesystem type
-	// 10: mount source
-	// 11: super options
-	mockData := `25 30 8:2 / / rw,relatime - ext4 /dev/sda2 rw
-26 25 0:21 / /dev rw,nosuid,relatime - devtmpfs devtmpfs rw,size=16301136k,nr_inodes=4075284,mode=755
-27 25 8:2 /var/lib/docker/containers /mnt/root rw,relatime - ext4 /dev/sda2 rw
-36 35 0:20 / /sys rw,nosuid,nodev,noexec,relatime - sysfs sysfs rw
-37 35 8:3 / /mnt/backup rw,relatime - ext4 /dev/sda3 rw
-`
-	err := os.WriteFile(mockProcFile, []byte(mockData), 0644)
-	if err != nil {
-		t.Fatalf("Failed to create mock mountinfo: %v", err)
-	}
-
-	t.Run("resolve root", func(t *testing.T) {
-		dev := getBlockDeviceForMount("/", mockProcFile)
-		assert.Equal(t, "/dev/sda2", dev)
-	})
-
-	t.Run("resolve bind mount", func(t *testing.T) {
-		dev := getBlockDeviceForMount("/mnt/root", mockProcFile)
-		assert.Equal(t, "/dev/sda2", dev)
-	})
-
-	t.Run("resolve specific mount", func(t *testing.T) {
-		dev := getBlockDeviceForMount("/mnt/backup", mockProcFile)
-		assert.Equal(t, "/dev/sda3", dev)
-	})
-
-	t.Run("pseudo fs is ignored", func(t *testing.T) {
-		dev := getBlockDeviceForMount("/sys", mockProcFile)
-		assert.Equal(t, "", dev, "sysfs should return empty as it does not start with /")
-	})
-}
-
 func TestResolveKernelDeviceName(t *testing.T) {
 	ioCounters := map[string]disk.IOCountersStat{
 		"sda":        {Name: "sda"},
@@ -273,24 +217,6 @@ func TestResolveKernelDeviceName(t *testing.T) {
 			found:      true,
 		},
 		{
-			name:       "partition strips to parent",
-			devicePath: "/dev/sda2",
-			expected:   "sda",
-			found:      true,
-		},
-		{
-			name:       "nvme partition strips to parent",
-			devicePath: "/dev/nvme0n1p2",
-			expected:   "nvme0n1",
-			found:      true,
-		},
-		{
-			name:       "label fallback",
-			devicePath: "/dev/mapper/oldlabel",
-			expected:   "old_device",
-			found:      true,
-		},
-		{
 			name:       "not found",
 			devicePath: "/dev/does_not_exist",
 			expected:   "",
@@ -301,12 +227,6 @@ func TestResolveKernelDeviceName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			match, found := resolveKernelDeviceName(tt.devicePath, ioCounters)
-
-			// If we are not on linux, the function just checks filepath.Base
-			// so skip exact matching behavior tests if non-linux and it wouldn't match.
-			if runtime.GOOS != "linux" && tt.name != "exact match" {
-				t.Skip("skipping linux-specific resolution tests on non-linux")
-			}
 
 			assert.Equal(t, tt.found, found)
 			if found {
