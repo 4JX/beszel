@@ -25,10 +25,7 @@ type Agent struct {
 	debug                     bool                                                  // true if LOG_LEVEL is set to debug
 	zfs                       bool                                                  // true if system has arcstats
 	memCalc                   string                                                // Memory calculation formula
-	fsNames                   []string                                              // List of filesystem device names being monitored
-	fsStats                   map[string]*system.FsStats                            // Keeps track of disk stats for each filesystem (keyed by mountpoint)
-	ioDeviceForMount          map[string]string                                     // Maps mountpoint to kernel device name for I/O lookups
-	diskPrev                  map[uint16]map[string]prevDisk                        // Previous disk I/O counters per cache interval
+	disks                     map[string]*trackedDisk                               // Authoritative runtime disk state (keyed by canonical disk key)
 	diskUsageCacheDuration    time.Duration                                         // How long to cache disk usage (to avoid waking sleeping disks)
 	lastDiskUsageUpdate       time.Time                                             // Last time disk usage was collected
 	netInterfaces             map[string]struct{}                                   // Stores all valid network interfaces
@@ -53,13 +50,10 @@ type Agent struct {
 // If the data directory is not set, it will attempt to find the optimal directory.
 func NewAgent(dataDir ...string) (agent *Agent, err error) {
 	agent = &Agent{
-		fsStats:          make(map[string]*system.FsStats),
-		ioDeviceForMount: make(map[string]string),
-		cache:            NewSystemDataCache(),
+		disks: make(map[string]*trackedDisk),
+		cache: NewSystemDataCache(),
 	}
 
-	// Initialize disk I/O previous counters storage
-	agent.diskPrev = make(map[uint16]map[string]prevDisk)
 	// Initialize per-cache-time network tracking structures
 	agent.netIoStats = make(map[uint16]system.NetIoStats)
 	agent.netInterfaceDeltaTrackers = make(map[uint16]*deltatracker.DeltaTracker[string, uint64])
@@ -204,27 +198,32 @@ func (a *Agent) gatherStats(options common.DataRequestOptions) *system.CombinedD
 		}
 	}
 
-	data.Stats.ExtraFs = make(map[string]*system.FsStats)
-	data.Info.ExtraFsPct = make(map[string]float64)
-	for name, stats := range a.fsStats {
-		if !stats.Root && stats.DiskTotal > 0 {
-			// Use custom name (alias) if available, otherwise use mountpoint basename
-			key := stats.Name
-			if key == "" {
-				key = filepath.Base(name) // name is mountpoint
-			}
-			data.Stats.ExtraFs[key] = stats
-			// Add percentages to Info struct for dashboard
-			if stats.DiskTotal > 0 {
-				pct := twoDecimals((stats.DiskUsed / stats.DiskTotal) * 100)
-				data.Info.ExtraFsPct[key] = pct
-			}
-		}
-	}
-	slog.Debug("Extra FS", "data", data.Stats.ExtraFs)
+	a.populateExtraFs(data)
 
 	a.cache.Set(data, cacheTimeMs)
 	return data
+}
+
+func (a *Agent) populateExtraFs(data *system.CombinedData) {
+	data.Stats.ExtraFs = make(map[string]*system.FsStats)
+	data.Info.ExtraFsPct = make(map[string]float64)
+	for _, tracked := range a.disks {
+		if tracked == nil || tracked.stats == nil {
+			continue
+		}
+		stats := tracked.stats
+		if !stats.Root && stats.DiskTotal > 0 {
+			// Use custom name (alias) if available, otherwise use canonical key basename.
+			key := stats.Name
+			if key == "" {
+				key = filepath.Base(tracked.key)
+			}
+			data.Stats.ExtraFs[key] = stats
+			pct := twoDecimals((stats.DiskUsed / stats.DiskTotal) * 100)
+			data.Info.ExtraFsPct[key] = pct
+		}
+	}
+	slog.Debug("Extra FS", "data", data.Stats.ExtraFs)
 }
 
 // Start initializes and starts the agent with optional WebSocket connection
