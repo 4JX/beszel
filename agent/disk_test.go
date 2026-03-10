@@ -270,6 +270,75 @@ func TestResolveKernelDeviceName(t *testing.T) {
 	}
 }
 
+func TestResolveKernelNameFromDiskstats(t *testing.T) {
+	tmpDir := t.TempDir()
+	procFile := filepath.Join(tmpDir, "diskstats")
+	content := " 259       0 nvme1n1 1 2 3 4\n 259       1 nvme1n1p1 1 2 3 4\n"
+	if err := os.WriteFile(procFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("failed to write proc diskstats fixture: %v", err)
+	}
+
+	prev := procDiskstatsPath
+	procDiskstatsPath = procFile
+	t.Cleanup(func() { procDiskstatsPath = prev })
+
+	kernelName, found, reason := resolveKernelNameFromDiskstats(259, 1)
+	assert.True(t, found)
+	assert.Equal(t, "nvme1n1p1", kernelName)
+	assert.Equal(t, "proc_diskstats_match", reason)
+
+	kernelName, found, reason = resolveKernelNameFromDiskstats(8, 9)
+	assert.False(t, found)
+	assert.Empty(t, kernelName)
+	assert.Equal(t, "proc_diskstats_no_match", reason)
+}
+
+func TestResolveIoDeviceFromSysfs(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	prevSys := sysDevBlockRoot
+	prevProc := procDiskstatsPath
+	sysDevBlockRoot = filepath.Join(tmpDir, "missing-sys-dev-block")
+	t.Cleanup(func() {
+		sysDevBlockRoot = prevSys
+		procDiskstatsPath = prevProc
+	})
+
+	t.Run("proc diskstats fallback", func(t *testing.T) {
+		procFile := filepath.Join(tmpDir, "diskstats-fallback")
+		content := "   8        2 sda2 1 2 3 4\n"
+		if err := os.WriteFile(procFile, []byte(content), 0o644); err != nil {
+			t.Fatalf("failed to write proc diskstats fixture: %v", err)
+		}
+		procDiskstatsPath = procFile
+
+		ioCounters := map[string]disk.IOCountersStat{
+			"sda2": {Name: "sda2"},
+		}
+		device, available, reason := resolveIoDeviceFromSysfs(8, 2, "/", ioCounters)
+		assert.True(t, available)
+		assert.Equal(t, "sda2", device)
+		assert.Equal(t, "linux_proc_diskstats_exact_match", reason)
+	})
+
+	t.Run("mount source fallback", func(t *testing.T) {
+		procFile := filepath.Join(tmpDir, "diskstats-source-fallback")
+		content := "   8        0 sda 1 2 3 4\n"
+		if err := os.WriteFile(procFile, []byte(content), 0o644); err != nil {
+			t.Fatalf("failed to write proc diskstats fixture: %v", err)
+		}
+		procDiskstatsPath = procFile
+
+		ioCounters := map[string]disk.IOCountersStat{
+			"sdb1": {Name: "sdb1"},
+		}
+		device, available, reason := resolveIoDeviceFromSysfs(8, 9, "/dev/sdb1", ioCounters)
+		assert.True(t, available)
+		assert.Equal(t, "sdb1", device)
+		assert.Equal(t, "linux_source_exact_match", reason)
+	})
+}
+
 func testTrackedDisk(key, ioDevice string, stats *system.FsStats) *trackedDisk {
 	return &trackedDisk{
 		key:            key,

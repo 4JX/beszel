@@ -1,12 +1,14 @@
 package agent
 
 import (
+	"bufio"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -92,6 +94,12 @@ const (
 	ioResolveSourceKernelPath ioResolveSource = "kernel_device_path"
 )
 
+// Linux test hooks.
+var (
+	sysDevBlockRoot   = "/sys/dev/block"
+	procDiskstatsPath = "/proc/diskstats"
+)
+
 type ioResolveResult struct {
 	device    string
 	available bool
@@ -110,16 +118,6 @@ func resolveIoDeviceForEntry(entry DiskEntry, part disk.PartitionStat, diskIoCou
 			device:    entry.IoDevice,
 			available: exists,
 			source:    ioResolveSourceOverride,
-			reason:    reason,
-		}
-	}
-
-	if runtime.GOOS == "linux" {
-		ioDevice, ioAvailable, reason := resolveIoDeviceForLinuxMountpoint(part.Mountpoint, diskIoCounters)
-		return ioResolveResult{
-			device:    ioDevice,
-			available: ioAvailable,
-			source:    ioResolveSourceLinuxMount,
 			reason:    reason,
 		}
 	}
@@ -180,6 +178,18 @@ func canonicalDiskKey(identifier string, part disk.PartitionStat) string {
 	return part.Device
 }
 
+func resolvePartitionForEntry(entry DiskEntry, partitions []disk.PartitionStat) (disk.PartitionStat, *mountinfo.Info, bool) {
+	// On Linux mountpoint identifiers, prefer mountinfo to avoid gopsutil bind-mount quirks.
+	if entry.IoDevice == "" && isLinuxMountpoint(entry.Identifier) {
+		if info, reason := linuxMountInfo(entry.Identifier); reason == "" {
+			return disk.PartitionStat{Mountpoint: entry.Identifier, Device: info.Source}, info, true
+		}
+	}
+
+	part, found := findPartition(entry.Identifier, partitions)
+	return part, nil, found
+}
+
 // Sets up the filesystems to monitor for disk usage and I/O.
 func (a *Agent) initializeDiskInfo() {
 	// Rebuild tracked state on initialization to avoid stale mappings if re-run.
@@ -216,7 +226,8 @@ func (a *Agent) initializeDiskInfo() {
 	for i, entry := range diskEntries {
 		isRoot := (i == 0 && !rootConfigured) || isRootEntry(entry, rootMountPoint)
 
-		part, found := findPartition(entry.Identifier, partitions)
+		part, linuxInfo, found := resolvePartitionForEntry(entry, partitions)
+
 		if !found {
 			if isRoot {
 				// Don't log a warning if it's the auto root and it just didn't exist
@@ -244,7 +255,18 @@ func (a *Agent) initializeDiskInfo() {
 		}
 
 		// Resolve I/O device
-		resolved := resolveIoDeviceForEntry(entry, part, diskIoCounters)
+		var resolved ioResolveResult
+		if linuxInfo != nil {
+			ioDev, ioAvail, ioReason := resolveIoDeviceFromSysfs(linuxInfo.Major, linuxInfo.Minor, linuxInfo.Source, diskIoCounters)
+			resolved = ioResolveResult{
+				device:    ioDev,
+				available: ioAvail,
+				source:    ioResolveSourceLinuxMount,
+				reason:    ioReason,
+			}
+		} else {
+			resolved = resolveIoDeviceForEntry(entry, part, diskIoCounters)
+		}
 
 		if resolved.available {
 			slog.Info("Disk configured", "id", entry.Identifier, "alias", entry.Alias, "mountpoint", mountpoint, "device", part.Device, "ioDevice", resolved.device, "ioAvailable", true, "ioSource", resolved.source, "ioReason", resolved.reason)
@@ -293,11 +315,6 @@ func findPartition(identifier string, partitions []disk.PartitionStat) (disk.Par
 		return disk.PartitionStat{}, false
 	}
 
-	// Linux mountpoint-first path: query mountinfo directly for the source device.
-	if part, ok := resolveLinuxMountpointPartition(identifier); ok {
-		return part, true
-	}
-
 	resolvedID := identifier
 	if symlinkTarget, err := filepath.EvalSymlinks(identifier); err == nil {
 		resolvedID = symlinkTarget
@@ -329,6 +346,16 @@ func findPartition(identifier string, partitions []disk.PartitionStat) (disk.Par
 	return disk.PartitionStat{}, false
 }
 
+func isLinuxMountpoint(identifier string) bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	if identifier == "/" {
+		return true
+	}
+	return strings.HasPrefix(identifier, "/") && !strings.HasPrefix(identifier, "/dev/")
+}
+
 func linuxMountInfo(mountpoint string) (*mountinfo.Info, string) {
 	if runtime.GOOS != "linux" {
 		return nil, "non_linux_platform"
@@ -341,24 +368,6 @@ func linuxMountInfo(mountpoint string) (*mountinfo.Info, string) {
 		return nil, "mountinfo_entry_not_found"
 	}
 	return info[0], ""
-}
-
-func resolveLinuxMountpointPartition(identifier string) (disk.PartitionStat, bool) {
-	// Linux only: direct mountpoint resolution is the primary path for mount identifiers.
-	// This bypasses gopsutil bind-mount quirks.
-	if identifier != "/" {
-		if !strings.HasPrefix(identifier, "/") || strings.HasPrefix(identifier, "/dev/") {
-			return disk.PartitionStat{}, false
-		}
-	}
-	info, reason := linuxMountInfo(identifier)
-	if reason != "" || !strings.HasPrefix(info.Source, "/") {
-		return disk.PartitionStat{}, false
-	}
-	return disk.PartitionStat{
-		Mountpoint: identifier,
-		Device:     info.Source,
-	}, true
 }
 
 // parentDiskName strips trailing partition suffix: sda1→sda, nvme0n1p1→nvme0n1
@@ -415,29 +424,68 @@ func resolveIoDeviceFromKernelName(kernelName string, diskIoCounters map[string]
 	return kernelName, false, "device_not_in_diskstats"
 }
 
-// resolveIoDeviceForLinuxMountpoint determines the best diskstats key for a Linux mountpoint.
-func resolveIoDeviceForLinuxMountpoint(mountpoint string, diskIoCounters map[string]disk.IOCountersStat) (string, bool, string) {
-	info, reason := linuxMountInfo(mountpoint)
-	if reason != "" {
-		return "", false, reason
-	}
-
-	major, minor := info.Major, info.Minor
-
-	// 2. Map major:minor to device node
-	sysfsPath := fmt.Sprintf("/sys/dev/block/%d:%d", major, minor)
-	target, err := filepath.EvalSymlinks(sysfsPath)
+func resolveKernelNameFromDiskstats(major, minor int) (string, bool, string) {
+	content, err := os.ReadFile(procDiskstatsPath)
 	if err != nil {
-		return "", false, "sysfs_dev_block_not_found"
+		return "", false, "proc_diskstats_unreadable"
 	}
 
-	kernelName := filepath.Base(target)
-	if kernelName == "" || kernelName == "." {
-		return "", false, "sysfs_kernel_name_empty"
+	scanner := bufio.NewScanner(strings.NewReader(string(content)))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		lineMajor, err1 := strconv.Atoi(fields[0])
+		lineMinor, err2 := strconv.Atoi(fields[1])
+
+		if err1 == nil && err2 == nil && lineMajor == major && lineMinor == minor {
+			return fields[2], true, "proc_diskstats_match"
+		}
 	}
 
-	ioDevice, ioAvailable, reason := resolveIoDeviceFromKernelName(kernelName, diskIoCounters)
-	return ioDevice, ioAvailable, "linux_" + reason
+	return "", false, "proc_diskstats_no_match"
+}
+
+func resolveIoDeviceFromSysfs(major, minor int, source string, diskIoCounters map[string]disk.IOCountersStat) (string, bool, string) {
+	// 1. Preferred path: map major:minor -> kernel device name via sysfs.
+	sysfsPath := filepath.Join(sysDevBlockRoot, fmt.Sprintf("%d:%d", major, minor))
+	if realPath, err := filepath.EvalSymlinks(sysfsPath); err == nil {
+		deviceName := filepath.Base(realPath)
+		if deviceName == "" || deviceName == "." {
+			return "", false, "sysfs_kernel_name_empty"
+		}
+
+		// Exact partition match mapping in diskstats directly
+		if _, exists := diskIoCounters[deviceName]; exists {
+			return deviceName, true, "linux_sysfs_exact"
+		}
+
+		// Check if it's a partition and walk to parent disk
+		if _, err := os.Stat(filepath.Join(realPath, "partition")); err == nil {
+			parentName := filepath.Base(filepath.Dir(realPath))
+			if _, exists := diskIoCounters[parentName]; exists {
+				return parentName, true, "linux_sysfs_parent"
+			}
+			return parentName, false, "linux_sysfs_parent_not_in_diskstats"
+		}
+
+		return deviceName, false, "linux_sysfs_not_in_diskstats"
+	}
+
+	// 2. Container fallback: parse /proc/diskstats when /sys/dev/block is unavailable.
+	if kernelName, ok, _ := resolveKernelNameFromDiskstats(major, minor); ok {
+		ioDevice, ioAvailable, reason := resolveIoDeviceFromKernelName(kernelName, diskIoCounters)
+		return ioDevice, ioAvailable, "linux_proc_diskstats_" + reason
+	}
+
+	// 3. Last resort: use mount source if it's a device path.
+	if strings.HasPrefix(source, "/dev/") {
+		ioDevice, ioAvailable, reason := resolveKernelDeviceName(source, diskIoCounters)
+		return ioDevice, ioAvailable, "linux_source_" + reason
+	}
+
+	return "", false, "linux_sysfs_dev_block_not_found"
 }
 
 // resolveKernelDeviceName determines the best diskstats key for a given device path.
