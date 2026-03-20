@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"log/slog"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -16,130 +17,172 @@ import (
 	"github.com/shirou/gopsutil/v4/disk"
 )
 
+var (
+	diskUsageFn      = disk.Usage
+	diskIOCountersFn = disk.IOCounters
+	discoverMountsFn = discoverMounts
+)
+
 type diskSpec struct {
-	Identifier, Alias, IoOverride string
+	Identifier string
+	Alias      string
+	IoOverride string
 }
 
 type mountRec struct {
-	Path, Source, SourceReal string
-	Major, Minor             int
+	Path       string
+	Source     string
+	SourceReal string
+	MajorMinor string
+	Root       bool
 }
 
 type trackedDisk struct {
-	UsagePath string // Path passed to disk.Usage()
-	IoDevice  string // Canonical IOCounters key (e.g., "sda")
-	Stats     *system.FsStats
+	Key        string
+	UsagePath  string
+	IOKey      string
+	Resolution string
+	Stats      *system.FsStats
 }
 
 type ioSample struct {
-	read, write uint64
-	at          time.Time
+	read  uint64
+	write uint64
+	at    time.Time
 }
 
-// initializeDiskInfo snapshots the system state and maps user identifiers to tracking targets.
+type ioIndex struct {
+	byAlias      map[string]string
+	byMajorMinor map[string]string
+}
+
+// initializeDiskInfo discovers monitored filesystems and optionally binds them to disk I/O counters.
 func (a *Agent) initializeDiskInfo() {
-	counters, err := disk.IOCounters()
+	counters, err := diskIOCountersFn()
 	if err != nil {
 		slog.Warn("Error getting initial disk I/O counters", "err", err)
 		counters = make(map[string]disk.IOCountersStat)
 	}
-	ioAliases := buildIOAliasMap(counters)
-	diskstats := getDiskstatsMap()
-	mounts := discoverMounts()
 
-	rootPath := chooseRootPath(mounts)
+	osName := runtime.GOOS
+	mounts := discoverMountsFn()
+	rootPath := chooseRootPath(osName, mounts)
 	specs := parseDiskSpecs(os.Getenv("DISKS"))
-	if !hasRootSpec(specs, rootPath) {
+	if !hasRootSpec(osName, specs, rootPath) {
 		specs = append([]diskSpec{{Identifier: rootPath, Alias: "root"}}, specs...)
 	}
 
-	// Reset agent state
-	a.disks = make([]*trackedDisk, 0, len(specs))
-	a.byIODevice = make(map[string][]*trackedDisk)
+	targets := materializeTrackedDisks(osName, mounts, rootPath, specs, buildIOIndex(counters, getDiskstatsMap()))
+	if !hasRootTarget(targets) {
+		slog.Warn("No root entry resolved; adding usage-only root fallback", "path", rootPath)
+		targets = append(targets, &trackedDisk{
+			Key:        normalizePath(osName, rootPath),
+			UsagePath:  rootPath,
+			Resolution: "usage_only",
+			Stats: &system.FsStats{
+				Name:       "root",
+				Mountpoint: rootPath,
+				Root:       true,
+			},
+		})
+	}
+
+	a.disks = targets
+	a.byIODevice = make(map[string][]*trackedDisk, len(targets))
 	a.prevIO = make(map[uint16]map[string]ioSample)
 	a.ioDevices = a.ioDevices[:0]
 
-	seenUsage := make(map[string]struct{}, len(specs))
-	rootResolved := false
+	for _, target := range a.disks {
+		if target.IOKey == "" {
+			continue
+		}
+		a.byIODevice[target.IOKey] = append(a.byIODevice[target.IOKey], target)
+	}
+	for ioKey := range a.byIODevice {
+		a.ioDevices = append(a.ioDevices, ioKey)
+	}
+	sort.Strings(a.ioDevices)
+	a.initializeDiskIoTotals(counters)
+}
 
-	for _, spec := range specs {
-		usagePath, mRec, found := resolveToMount(spec.Identifier, mounts)
-		if usagePath == "" {
+func materializeTrackedDisks(osName string, mounts []mountRec, rootPath string, specs []diskSpec, idx ioIndex) []*trackedDisk {
+	seenUsage := make(map[string]struct{}, len(specs))
+	targets := make([]*trackedDisk, 0, len(specs))
+
+	for _, spec := range sanitizeDiskSpecs(osName, specs, rootPath) {
+		mount, ok := resolveMount(osName, spec.Identifier, mounts)
+		if !ok || mount.Path == "" {
 			continue
 		}
 
-		// Dedupe using normalized keys to handle trailing slashes and Windows casing
-		usageKey := normalizePathKey(usagePath)
+		usageKey := normalizePath(osName, mount.Path)
 		if _, exists := seenUsage[usageKey]; exists {
-			slog.Warn("Duplicate disk ignored", "path", usagePath, "identifier", spec.Identifier)
+			slog.Warn("Duplicate disk ignored", "identifier", spec.Identifier, "path", mount.Path)
 			continue
 		}
 		seenUsage[usageKey] = struct{}{}
 
-		isRoot := samePath(usagePath, rootPath) || strings.EqualFold(spec.Alias, "root")
+		isRoot := mount.Root || samePath(osName, mount.Path, rootPath) || strings.EqualFold(spec.Alias, "root")
 		name := spec.Alias
 		if name == "" {
 			if isRoot {
 				name = "root"
 			} else {
-				name = filepath.Base(filepath.Clean(usagePath))
+				name = filepath.Base(filepath.Clean(mount.Path))
 			}
 		}
 
-		// Candidate resolution: Override > Kernel Name > Symlink > Source > Identifier
-		candidates := make([]string, 0, 6)
-		if spec.IoOverride != "" {
-			candidates = append(candidates, spec.IoOverride)
-		}
-		if found {
-			candidates = append(candidates,
-				diskstats[[2]int{mRec.Major, mRec.Minor}],
-				mRec.SourceReal, parentDiskName(mRec.SourceReal),
-				mRec.Source, parentDiskName(mRec.Source),
-			)
-		}
-		// Only use identifier as an I/O candidate if it's a device path or a simple token (not an absolute dir)
-		if isDevicePath(spec.Identifier) || !filepath.IsAbs(spec.Identifier) {
-			candidates = append(candidates, spec.Identifier)
-			if isDevicePath(spec.Identifier) {
-				candidates = append(candidates, parentDiskName(spec.Identifier))
-			}
-		}
-
-		ioDev, ok := lookupIODevice(candidates, ioAliases)
-		if !ok {
-			slog.Warn("Disk configured without I/O device", "identifier", spec.Identifier, "usagePath", usagePath, "candidates", candidates)
-		}
-
-		td := &trackedDisk{
-			UsagePath: usagePath,
-			IoDevice:  ioDev,
-			Stats:     &system.FsStats{Name: name, Mountpoint: usagePath, Root: isRoot},
-		}
-
-		a.disks = append(a.disks, td)
-		if ok {
-			a.byIODevice[ioDev] = append(a.byIODevice[ioDev], td)
-		}
-		if isRoot {
-			rootResolved = true
-		}
-	}
-
-	// Final root safety fallback
-	if !rootResolved {
-		slog.Warn("No root entry resolved; adding usage-only root fallback", "path", rootPath)
-		a.disks = append(a.disks, &trackedDisk{
-			UsagePath: rootPath,
-			Stats:     &system.FsStats{Name: "root", Mountpoint: rootPath, Root: true},
+		ioKey, rule := bindMountIO(osName, mount, spec, idx)
+		targets = append(targets, &trackedDisk{
+			Key:        usageKey,
+			UsagePath:  mount.Path,
+			IOKey:      ioKey,
+			Resolution: rule,
+			Stats: &system.FsStats{
+				Name:       name,
+				Mountpoint: mount.Path,
+				Root:       isRoot,
+			},
 		})
 	}
 
-	// Build cached list of unique I/O devices for the sampling pass
-	for dev := range a.byIODevice {
-		a.ioDevices = append(a.ioDevices, dev)
+	return pruneRootMirrors(targets)
+}
+
+func sanitizeDiskSpecs(osName string, specs []diskSpec, rootPath string) []diskSpec {
+	out := make([]diskSpec, 0, len(specs)+1)
+	seen := make(map[string]struct{}, len(specs))
+	rootPresent := false
+
+	for _, spec := range specs {
+		spec.Identifier = strings.TrimSpace(spec.Identifier)
+		if spec.Identifier == "" {
+			continue
+		}
+		key := normalizePath(osName, spec.Identifier)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, spec)
+		if samePath(osName, spec.Identifier, rootPath) || strings.EqualFold(spec.Alias, "root") {
+			rootPresent = true
+		}
 	}
-	sort.Strings(a.ioDevices)
+
+	if !rootPresent && rootPath != "" {
+		out = append([]diskSpec{{Identifier: rootPath, Alias: "root"}}, out...)
+	}
+	return out
+}
+
+func hasRootTarget(targets []*trackedDisk) bool {
+	for _, target := range targets {
+		if target != nil && target.Stats != nil && target.Stats.Root {
+			return true
+		}
+	}
+	return false
 }
 
 // updateDiskUsage updates filesystem usage stats.
@@ -154,12 +197,11 @@ func (a *Agent) updateDiskUsage(systemStats *system.Stats) {
 			continue
 		}
 		stats := tracked.Stats
-
 		if cacheExtraFs && !stats.Root {
 			continue
 		}
 
-		d, err := disk.Usage(tracked.UsagePath)
+		d, err := diskUsageFn(tracked.UsagePath)
 		if err != nil {
 			slog.Error("Error getting disk usage", "path", tracked.UsagePath, "err", err)
 			stats.DiskTotal = 0
@@ -186,12 +228,13 @@ func (a *Agent) updateDiskUsage(systemStats *system.Stats) {
 	}
 }
 
-// updateDiskIo calculates throughput rates per block device and updates all sharing filesystems.
+// updateDiskIo calculates throughput rates per bound I/O source and updates all sharing filesystems.
 func (a *Agent) updateDiskIo(interval uint16, systemStats *system.Stats) {
 	if len(a.ioDevices) == 0 {
 		return
 	}
-	counters, err := disk.IOCounters(a.ioDevices...)
+
+	counters, err := diskIOCountersFn(a.ioDevices...)
 	if err != nil {
 		slog.Error("Error getting disk I/O counters", "err", err)
 		return
@@ -203,17 +246,22 @@ func (a *Agent) updateDiskIo(interval uint16, systemStats *system.Stats) {
 	}
 	prevMap := a.prevIO[interval]
 
-	for _, dev := range a.ioDevices {
-		c, ok := counters[dev]
+	for _, ioKey := range a.ioDevices {
+		counter, ok := counters[ioKey]
 		if !ok {
 			continue
 		}
 
-		curr := ioSample{read: c.ReadBytes, write: c.WriteBytes, at: now}
-		prev, hasPrev := prevMap[dev]
-		prevMap[dev] = curr
+		curr := ioSample{read: counter.ReadBytes, write: counter.WriteBytes, at: now}
+		prev, hasPrev := prevMap[ioKey]
+		prevMap[ioKey] = curr
 
-		// Guard: Need history, significant time gap, and no counter underflow/reboots
+		for _, target := range a.byIODevice[ioKey] {
+			target.Stats.TotalRead = counter.ReadBytes
+			target.Stats.TotalWrite = counter.WriteBytes
+			target.Stats.Time = now
+		}
+
 		if !hasPrev || prev.at.IsZero() || now.Sub(prev.at) < 100*time.Millisecond ||
 			curr.read < prev.read || curr.write < prev.write {
 			continue
@@ -226,253 +274,316 @@ func (a *Agent) updateDiskIo(interval uint16, systemStats *system.Stats) {
 
 		readBps := (curr.read - prev.read) * 1000 / ms
 		writeBps := (curr.write - prev.write) * 1000 / ms
-		readMBps, writeMBps := bytesToMegabytes(float64(readBps)), bytesToMegabytes(float64(writeBps))
-
-		if readMBps > 50_000 || writeMBps > 50_000 { // Sanity cap
+		readMBps := bytesToMegabytes(float64(readBps))
+		writeMBps := bytesToMegabytes(float64(writeBps))
+		if readMBps > 50_000 || writeMBps > 50_000 {
 			continue
 		}
 
-		for _, td := range a.byIODevice[dev] {
-			td.Stats.DiskReadPs, td.Stats.DiskWritePs = readMBps, writeMBps
-			td.Stats.DiskReadBytes, td.Stats.DiskWriteBytes = readBps, writeBps
-			if td.Stats.Root {
-				systemStats.DiskReadPs, systemStats.DiskWritePs = readMBps, writeMBps
-				systemStats.DiskIO[0], systemStats.DiskIO[1] = readBps, writeBps
+		for _, target := range a.byIODevice[ioKey] {
+			target.Stats.DiskReadPs = readMBps
+			target.Stats.DiskWritePs = writeMBps
+			target.Stats.DiskReadBytes = readBps
+			target.Stats.DiskWriteBytes = writeBps
+			if target.Stats.Root {
+				systemStats.DiskReadPs = readMBps
+				systemStats.DiskWritePs = writeMBps
+				systemStats.DiskIO[0] = readBps
+				systemStats.DiskIO[1] = writeBps
 			}
 		}
+	}
+}
+
+func (a *Agent) initializeDiskIoTotals(counters map[string]disk.IOCountersStat) {
+	now := time.Now()
+	for _, target := range a.disks {
+		if target == nil || target.Stats == nil || target.IOKey == "" {
+			continue
+		}
+		counter, ok := counters[target.IOKey]
+		if !ok {
+			continue
+		}
+		target.Stats.TotalRead = counter.ReadBytes
+		target.Stats.TotalWrite = counter.WriteBytes
+		target.Stats.Time = now
 	}
 }
 
 // discoverMounts returns normalized mount records.
 // Linux uses mountinfo; other platforms fall back to disk.Partitions(false).
-func discoverMounts() (records []mountRec) {
-	if runtime.GOOS == "linux" {
-		if mounts, err := mountinfo.GetMounts(nil); err == nil {
-			for _, m := range mounts {
-				realSrc, _ := filepath.EvalSymlinks(m.Source)
-				if realSrc == "" {
-					realSrc = m.Source
+func discoverMounts() []mountRec {
+	osName := runtime.GOOS
+	records := make([]mountRec, 0)
+
+	if osName == "linux" {
+		mounts, err := mountinfo.GetMounts(nil)
+		if err == nil {
+			records = make([]mountRec, 0, len(mounts))
+			for _, mount := range mounts {
+				sourceReal := mount.Source
+				if real, err := filepath.EvalSymlinks(mount.Source); err == nil && real != "" {
+					sourceReal = real
 				}
-				records = append(records, mountRec{Path: m.Mountpoint, Source: m.Source, SourceReal: realSrc, Major: m.Major, Minor: m.Minor})
+				records = append(records, mountRec{
+					Path:       mount.Mountpoint,
+					Source:     mount.Source,
+					SourceReal: sourceReal,
+					MajorMinor: strconv.Itoa(mount.Major) + ":" + strconv.Itoa(mount.Minor),
+				})
 			}
-			return
-		} else {
-			slog.Warn("Error getting mountinfo; falling back to disk partitions", "err", err)
+			return records
 		}
+		slog.Warn("Error getting mountinfo; falling back to disk partitions", "err", err)
 	}
-	if parts, err := disk.Partitions(false); err == nil {
-		for _, p := range parts {
-			src := p.Device
-			if runtime.GOOS == "windows" {
-				src = strings.TrimSuffix(src, `\`)
-			}
-			records = append(records, mountRec{Path: p.Mountpoint, Source: src, SourceReal: src})
-		}
-	} else {
+
+	partitions, err := disk.Partitions(false)
+	if err != nil {
 		slog.Warn("Error getting disk partitions", "err", err)
+		return records
 	}
-	return
+
+	records = make([]mountRec, 0, len(partitions))
+	for _, part := range partitions {
+		source := part.Device
+		if osName == "windows" {
+			source = strings.TrimRight(source, `\`)
+		}
+		records = append(records, mountRec{
+			Path:       part.Mountpoint,
+			Source:     source,
+			SourceReal: source,
+		})
+	}
+	return records
 }
 
-// resolveToMount resolves an identifier to its best usage target and mount record.
-func resolveToMount(id string, mounts []mountRec) (string, mountRec, bool) {
-	norm := normalizePathKey(id)
-	if norm == "" {
-		return "", mountRec{}, false
+func resolveMount(osName, identifier string, mounts []mountRec) (mountRec, bool) {
+	normIdentifier := normalizePath(osName, identifier)
+	if normIdentifier == "" {
+		return mountRec{}, false
 	}
 
-	// 1. Exact matches
-	for _, m := range mounts {
-		if samePath(m.Path, norm) || samePath(m.Source, norm) || samePath(m.SourceReal, norm) {
-			return m.Path, m, true
+	for _, mount := range mounts {
+		if samePath(osName, mount.Path, identifier) ||
+			samePath(osName, mount.Source, identifier) ||
+			samePath(osName, mount.SourceReal, identifier) {
+			return mount, true
 		}
 	}
 
-	// Device paths should not be resolved via mount-prefix heuristics.
-	if !filepath.IsAbs(id) || isDevicePath(id) {
-		return "", mountRec{}, false
+	if !isAbsPath(osName, identifier) || isDevicePath(osName, identifier) {
+		return mountRec{}, false
 	}
 
-	// 2. Subpath resolution (Deepest parent mount)
-	bestIdx, bestLen := -1, -1
-	for i, m := range mounts {
-		if hasMountPrefix(norm, m.Path) {
-			if l := len(normalizePathKey(m.Path)); l > bestLen {
-				bestIdx, bestLen = i, l
+	bestIndex := -1
+	bestLen := -1
+	for i, mount := range mounts {
+		if hasMountPrefix(osName, identifier, mount.Path) {
+			if l := len(normalizePath(osName, mount.Path)); l > bestLen {
+				bestIndex = i
+				bestLen = l
 			}
 		}
 	}
-	if bestIdx >= 0 {
-		return mounts[bestIdx].Path, mounts[bestIdx], true
+	if bestIndex >= 0 {
+		return mounts[bestIndex], true
 	}
 
-	// 3. Absolute path usage-only fallback
-	cleaned := filepath.Clean(id)
-	if _, err := disk.Usage(cleaned); err == nil {
-		return cleaned, mountRec{}, false
+	cleaned := normalizePath(osName, identifier)
+	if _, err := diskUsageFn(cleaned); err == nil {
+		return mountRec{Path: cleaned, Source: cleaned, SourceReal: cleaned}, true
 	}
-
-	return "", mountRec{}, false
+	return mountRec{}, false
 }
 
-func lookupIODevice(candidates []string, aliases map[string]string) (string, bool) {
-	seen := make(map[string]struct{})
-	for _, c := range candidates {
-		norm := normalizeDeviceName(c)
-		if _, exists := seen[norm]; norm == "" || exists {
-			continue
+func bindMountIO(osName string, mount mountRec, spec diskSpec, idx ioIndex) (string, string) {
+	if spec.IoOverride != "" {
+		if ioKey, ok := idx.byAlias[normalizeDeviceID(spec.IoOverride)]; ok {
+			return ioKey, "explicit_override"
 		}
-		seen[norm] = struct{}{}
-		if key, ok := aliases[norm]; ok {
-			return key, true
+		slog.Warn("Disk I/O override did not match any counter", "identifier", spec.Identifier, "override", spec.IoOverride)
+	}
+
+	switch osName {
+	case "linux":
+		if mount.MajorMinor != "" {
+			if ioKey, ok := idx.byMajorMinor[mount.MajorMinor]; ok {
+				return ioKey, "linux_major_minor"
+			}
+		}
+		if ioKey, ok := idx.byAlias[normalizeDeviceID(mount.SourceReal)]; ok {
+			return ioKey, "linux_source_real"
+		}
+		if ioKey, ok := idx.byAlias[normalizeDeviceID(mount.Source)]; ok {
+			return ioKey, "linux_source"
+		}
+		if parent := parentDeviceName(mount.SourceReal); parent != "" {
+			if ioKey, ok := idx.byAlias[parent]; ok {
+				return ioKey, "linux_parent"
+			}
+		}
+		if parent := parentDeviceName(mount.Source); parent != "" {
+			if ioKey, ok := idx.byAlias[parent]; ok {
+				return ioKey, "linux_parent"
+			}
+		}
+	case "freebsd":
+		if ioKey, ok := idx.byAlias[normalizeDeviceID(mount.SourceReal)]; ok {
+			return ioKey, "freebsd_source"
+		}
+		if parent := parentDeviceName(mount.SourceReal); parent != "" {
+			if ioKey, ok := idx.byAlias[parent]; ok {
+				return ioKey, "freebsd_parent"
+			}
+		}
+	case "windows":
+		if ioKey, ok := idx.byAlias[normalizeDeviceID(mount.SourceReal)]; ok {
+			return ioKey, "windows_drive"
+		}
+		if ioKey, ok := idx.byAlias[normalizeDeviceID(mount.Path)]; ok {
+			return ioKey, "windows_drive"
+		}
+	case "darwin":
+		if ioKey, ok := idx.byAlias[normalizeDeviceID(mount.SourceReal)]; ok {
+			return ioKey, "darwin_source"
+		}
+		if parent := parentDeviceName(mount.SourceReal); parent != "" {
+			if ioKey, ok := idx.byAlias[parent]; ok {
+				return ioKey, "darwin_parent"
+			}
 		}
 	}
-	return "", false
+
+	return "", "usage_only"
 }
 
-// --- Data Normalization Helpers ---
+func buildIOIndex(counters map[string]disk.IOCountersStat, diskstats map[string]string) ioIndex {
+	idx := ioIndex{
+		byAlias:      make(map[string]string, len(counters)*4),
+		byMajorMinor: make(map[string]string, len(diskstats)),
+	}
 
-func buildIOAliasMap(counters map[string]disk.IOCountersStat) map[string]string {
-	out := make(map[string]string, len(counters)*3)
 	for key, stat := range counters {
 		for _, raw := range []string{key, stat.Name, stat.Label} {
-			if norm := normalizeDeviceName(raw); norm != "" {
-				if _, ok := out[norm]; !ok {
-					out[norm] = key
-				}
+			norm := normalizeDeviceID(raw)
+			if norm == "" {
+				continue
+			}
+			if _, exists := idx.byAlias[norm]; !exists {
+				idx.byAlias[norm] = key
 			}
 		}
 	}
-	return out
+
+	for majorMinor, kernelName := range diskstats {
+		if ioKey, ok := idx.byAlias[normalizeDeviceID(kernelName)]; ok {
+			idx.byMajorMinor[majorMinor] = ioKey
+		}
+	}
+
+	return idx
 }
 
-func getDiskstatsMap() map[[2]int]string {
-	m := make(map[[2]int]string)
+func getDiskstatsMap() map[string]string {
 	if runtime.GOOS != "linux" {
-		return m
+		return nil
 	}
 
-	f, err := os.Open("/proc/diskstats")
+	file, err := os.Open("/proc/diskstats")
 	if err != nil {
-		return m
+		return nil
 	}
-	defer f.Close()
+	defer file.Close()
 
-	scanner := bufio.NewScanner(f)
+	out := make(map[string]string)
+	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) < 3 {
 			continue
 		}
-		maj, err1 := strconv.Atoi(fields[0])
-		min, err2 := strconv.Atoi(fields[1])
-		if err1 == nil && err2 == nil {
-			m[[2]int{maj, min}] = fields[2]
-		}
+		out[fields[0]+":"+fields[1]] = fields[2]
 	}
-	return m
+	return out
 }
 
-func chooseRootPath(mounts []mountRec) string {
-	if runtime.GOOS == "linux" {
-		for _, p := range []string{"/sysroot", "/"} {
-			for _, m := range mounts {
-				if samePath(m.Path, p) {
-					return p
+func chooseRootPath(osName string, mounts []mountRec) string {
+	if osName == "linux" {
+		for _, candidate := range []string{"/sysroot", "/"} {
+			for _, mount := range mounts {
+				if samePath(osName, mount.Path, candidate) {
+					return candidate
 				}
 			}
 		}
-		for _, p := range []string{"/etc/hosts", "/etc/hostname", "/etc/resolv.conf"} {
-			for _, m := range mounts {
-				if samePath(m.Path, p) &&
-					(strings.HasPrefix(m.Source, "/dev/") || strings.HasPrefix(m.SourceReal, "/dev/")) {
-					return p
+		for _, candidate := range []string{"/etc/hosts", "/etc/hostname", "/etc/resolv.conf"} {
+			for _, mount := range mounts {
+				if samePath(osName, mount.Path, candidate) &&
+					(strings.HasPrefix(mount.Source, "/dev/") || strings.HasPrefix(mount.SourceReal, "/dev/")) {
+					return candidate
 				}
 			}
 		}
 		return "/"
 	}
 
-	for _, m := range mounts {
-		if samePath(m.Path, "/") || samePath(m.Path, `C:\`) {
-			return m.Path
+	for _, mount := range mounts {
+		if samePath(osName, mount.Path, "/") || samePath(osName, mount.Path, `C:\`) {
+			return mount.Path
 		}
 	}
-	if len(mounts) > 0 && mounts[0].Path != "" {
+	if len(mounts) > 0 {
 		return mounts[0].Path
+	}
+	if osName == "windows" {
+		return `C:\`
 	}
 	return "/"
 }
 
-func normalizePathKey(path string) string {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return ""
+func pruneRootMirrors(targets []*trackedDisk) []*trackedDisk {
+	var root *trackedDisk
+	for _, target := range targets {
+		if target != nil && target.Stats != nil && target.Stats.Root {
+			root = target
+			break
+		}
 	}
-	p := filepath.Clean(path)
-	if runtime.GOOS == "windows" {
-		return strings.ToLower(strings.TrimSuffix(p, `\`))
+	if root == nil || root.IOKey == "" {
+		return targets
 	}
-	return p
+
+	out := make([]*trackedDisk, 0, len(targets))
+	for _, target := range targets {
+		if target == nil {
+			continue
+		}
+		if !target.Stats.Root &&
+			strings.HasPrefix(target.UsagePath, "/extra-filesystems/") &&
+			target.IOKey == root.IOKey {
+			continue
+		}
+		out = append(out, target)
+	}
+	return out
 }
 
-func samePath(a, b string) bool { return normalizePathKey(a) == normalizePathKey(b) }
-
-func hasMountPrefix(path, mount string) bool {
-	p, m := normalizePathKey(path), normalizePathKey(mount)
-	if p == m {
-		return true
-	}
-	if m == "/" {
-		return strings.HasPrefix(p, "/")
-	}
-	return strings.HasPrefix(p, m+string(filepath.Separator))
-}
-
-func normalizeDeviceName(v string) string {
-	base := filepath.Base(strings.TrimSpace(v))
-	if base == "." || base == "/" || base == "\\" {
-		return ""
-	}
-	return base
-}
-
-func parentDiskName(v string) string {
-	base := normalizeDeviceName(v)
-	parent := strings.TrimRight(base, "0123456789")
-	if b, ok := strings.CutSuffix(parent, "p"); ok {
-		parent = b
-	}
-	if parent == "" || parent == base {
-		return ""
-	}
-	return parent
-}
-
-func isDevicePath(p string) bool {
-	return runtime.GOOS != "windows" && strings.HasPrefix(filepath.Clean(p), "/dev/")
-}
-
-func parseDiskSpecs(env string) (specs []diskSpec) {
+func parseDiskSpecs(env string) []diskSpec {
 	env = strings.TrimSpace(env)
 	if env == "" {
 		return nil
 	}
 
-	seen := make(map[string]int)
-	for i, raw := range strings.Split(env, ",") {
+	specs := make([]diskSpec, 0)
+	for _, raw := range strings.Split(env, ",") {
 		parts := strings.SplitN(strings.TrimSpace(raw), "|", 3)
-		id := strings.TrimSpace(parts[0])
-		if id == "" {
+		identifier := strings.TrimSpace(parts[0])
+		if identifier == "" {
 			continue
 		}
-		if first, ok := seen[id]; ok {
-			slog.Warn("Duplicate DISKS identifier; keeping first occurrence", "identifier", id, "firstIndex", first, "duplicateIndex", i)
-			continue
-		}
-		seen[id] = i
-
-		spec := diskSpec{Identifier: id}
+		spec := diskSpec{Identifier: identifier}
 		if len(parts) > 1 {
 			spec.Alias = strings.TrimSpace(parts[1])
 		}
@@ -481,14 +592,164 @@ func parseDiskSpecs(env string) (specs []diskSpec) {
 		}
 		specs = append(specs, spec)
 	}
-	return
+	return specs
 }
 
-func hasRootSpec(specs []diskSpec, rootPath string) bool {
-	for _, s := range specs {
-		if samePath(s.Identifier, rootPath) || s.Identifier == "/" || strings.EqualFold(s.Alias, "root") {
+func hasRootSpec(osName string, specs []diskSpec, rootPath string) bool {
+	for _, spec := range specs {
+		if samePath(osName, spec.Identifier, rootPath) || strings.EqualFold(spec.Alias, "root") {
 			return true
 		}
 	}
 	return false
+}
+
+func normalizePath(osName, raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if osName == "windows" {
+		raw = strings.ReplaceAll(raw, "/", `\`)
+		if len(raw) >= 2 && raw[1] == ':' {
+			drive := strings.ToLower(raw[:2])
+			rest := strings.Trim(raw[2:], `\`)
+			if rest == "" {
+				return drive + `\`
+			}
+			parts := splitWindowsPath(rest)
+			if len(parts) == 0 {
+				return drive + `\`
+			}
+			return drive + `\` + strings.Join(parts, `\`)
+		}
+		return strings.ToLower(strings.TrimRight(raw, `\`))
+	}
+	return filepath.Clean(raw)
+}
+
+func splitWindowsPath(path string) []string {
+	fields := strings.FieldsFunc(path, func(r rune) bool { return r == '\\' || r == '/' })
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if field != "" {
+			out = append(out, field)
+		}
+	}
+	return out
+}
+
+func samePath(osName, a, b string) bool {
+	return normalizePath(osName, a) == normalizePath(osName, b)
+}
+
+func hasMountPrefix(osName, path, mount string) bool {
+	p := normalizePath(osName, path)
+	m := normalizePath(osName, mount)
+	if p == m {
+		return true
+	}
+	if osName == "windows" {
+		if strings.HasSuffix(m, `\`) {
+			return strings.HasPrefix(p, m)
+		}
+		return strings.HasPrefix(p, m+`\`)
+	}
+	if m == "/" {
+		return strings.HasPrefix(p, "/")
+	}
+	return strings.HasPrefix(p, m+string(filepath.Separator))
+}
+
+func isAbsPath(osName, path string) bool {
+	if osName == "windows" {
+		path = strings.TrimSpace(path)
+		return len(path) >= 3 &&
+			((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+			path[1] == ':' &&
+			(path[2] == '\\' || path[2] == '/')
+	}
+	return filepath.IsAbs(path)
+}
+
+func isDevicePath(osName, path string) bool {
+	if osName == "windows" {
+		return false
+	}
+	return strings.HasPrefix(filepath.Clean(path), "/dev/")
+}
+
+func normalizeDeviceID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	raw = strings.ReplaceAll(raw, `\`, "/")
+	raw = strings.TrimRight(raw, "/")
+	if raw == "" {
+		return ""
+	}
+	lower := strings.ToLower(raw)
+	if strings.HasPrefix(lower, "/dev/") {
+		return strings.TrimPrefix(lower, "/dev/")
+	}
+	if len(lower) == 2 && lower[1] == ':' {
+		return lower
+	}
+	if len(lower) == 3 && lower[1] == ':' && lower[2] == '/' {
+		return lower[:2]
+	}
+	if strings.Contains(lower, "/") {
+		return strings.ToLower(pathpkg.Base(lower))
+	}
+	return lower
+}
+
+func parentDeviceName(raw string) string {
+	device := normalizeDeviceID(raw)
+	if device == "" {
+		return ""
+	}
+	for _, prefix := range []string{"dm-", "md", "loop", "ram", "zram"} {
+		if strings.HasPrefix(device, prefix) {
+			return ""
+		}
+	}
+	for _, prefix := range []string{"nvme", "mmcblk", "nda", "nvd", "ada"} {
+		if strings.HasPrefix(device, prefix) {
+			if idx := strings.LastIndex(device, "p"); idx > 0 && allDigits(device[idx+1:]) {
+				return device[:idx]
+			}
+		}
+	}
+	if strings.HasPrefix(device, "disk") {
+		if idx := strings.LastIndex(device, "s"); idx > 0 && allDigits(device[idx+1:]) {
+			return device[:idx]
+		}
+	}
+
+	idx := len(device)
+	for idx > 0 && device[idx-1] >= '0' && device[idx-1] <= '9' {
+		idx--
+	}
+	if idx == len(device) || idx == 0 {
+		return ""
+	}
+	parent := strings.TrimSuffix(device[:idx], "p")
+	if parent == "" || parent == device {
+		return ""
+	}
+	return parent
+}
+
+func allDigits(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, ch := range v {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
 }

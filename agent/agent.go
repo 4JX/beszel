@@ -25,7 +25,10 @@ type Agent struct {
 	debug                     bool                                                  // true if LOG_LEVEL is set to debug
 	zfs                       bool                                                  // true if system has arcstats
 	memCalc                   string                                                // Memory calculation formula
-	disks                     map[string]*trackedDisk                               // Authoritative runtime disk state (keyed by canonical disk key)
+	disks                     []*trackedDisk                                        // Materialized monitored filesystem targets
+	byIODevice                map[string][]*trackedDisk                             // Targets grouped by I/O counter key
+	prevIO                    map[uint16]map[string]ioSample                        // Previous per-interval disk I/O samples
+	ioDevices                 []string                                              // Unique IOCounters keys to sample
 	diskUsageCacheDuration    time.Duration                                         // How long to cache disk usage (to avoid waking sleeping disks)
 	lastDiskUsageUpdate       time.Time                                             // Last time disk usage was collected
 	netInterfaces             map[string]struct{}                                   // Stores all valid network interfaces
@@ -50,8 +53,10 @@ type Agent struct {
 // If the data directory is not set, it will attempt to find the optimal directory.
 func NewAgent(dataDir ...string) (agent *Agent, err error) {
 	agent = &Agent{
-		disks: make(map[string]*trackedDisk),
-		cache: NewSystemDataCache(),
+		disks:      make([]*trackedDisk, 0),
+		byIODevice: make(map[string][]*trackedDisk),
+		prevIO:     make(map[uint16]map[string]ioSample),
+		cache:      NewSystemDataCache(),
 	}
 
 	// Initialize per-cache-time network tracking structures
@@ -208,15 +213,15 @@ func (a *Agent) populateExtraFs(data *system.CombinedData) {
 	data.Stats.ExtraFs = make(map[string]*system.FsStats)
 	data.Info.ExtraFsPct = make(map[string]float64)
 	for _, tracked := range a.disks {
-		if tracked == nil || tracked.stats == nil {
+		if tracked == nil || tracked.Stats == nil {
 			continue
 		}
-		stats := tracked.stats
+		stats := tracked.Stats
 		if !stats.Root && stats.DiskTotal > 0 {
-			// Use custom name (alias) if available, otherwise use canonical key basename.
+			// Use the explicit display name when available, otherwise fall back to the target key.
 			key := stats.Name
 			if key == "" {
-				key = filepath.Base(tracked.key)
+				key = filepath.Base(tracked.Key)
 			}
 			data.Stats.ExtraFs[key] = stats
 			pct := twoDecimals((stats.DiskUsed / stats.DiskTotal) * 100)
